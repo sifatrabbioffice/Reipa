@@ -1,0 +1,142 @@
+name: IPA reverse-engineering pipeline
+
+# Put this file at .github/workflows/ipa-reverse.yml in your repo,
+# then run it from the Actions tab with a direct IPA download URL.
+# Only use it on apps you own or are authorized to analyze.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct download URL of the .ipa"
+        required: true
+      decompile:
+        description: "Run Ghidra headless decompile (slow, 10-60+ min)"
+        type: boolean
+        default: true
+
+env:
+  GHIDRA_URL: https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.2_build/ghidra_11.3.2_PUBLIC_20250415.zip
+
+jobs:
+  reverse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip binutils openjdk-21-jdk-headless python3-pip
+          pip install --break-system-packages lief
+
+      - name: Download IPA
+        run: |
+          mkdir -p work out
+          curl -fL "${{ inputs.ipa_url }}" -o work/app.ipa
+          ls -lh work/app.ipa
+
+      - name: Extract .app
+        run: |
+          unzip -q work/app.ipa -d work/ipa
+          APP=$(find work/ipa/Payload -maxdepth 1 -name '*.app' | head -n1)
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          cp -r "$APP" out/app_bundle
+          unzip -l work/app.ipa > out/ipa_contents.txt
+
+      - name: Parse Info.plist and locate the main binary
+        run: |
+          python3 - <<'PY'
+          import plistlib, json, os
+          app = os.environ["APP"]
+          with open(os.path.join(app, "Info.plist"), "rb") as f:
+              info = plistlib.load(f)
+          json.dump(info, open("out/Info.plist.json", "w"), indent=2, default=str)
+          open("work/exec_name.txt", "w").write(info["CFBundleExecutable"])
+          print("Bundle ID:", info.get("CFBundleIdentifier"))
+          print("Executable:", info["CFBundleExecutable"])
+          PY
+
+      - name: Mach-O analysis (arch, encryption, libs, symbols)
+        run: |
+          python3 - <<'PY'
+          import lief, os, json
+          app = os.environ["APP"]
+          exe = open("work/exec_name.txt").read().strip()
+          path = os.path.join(app, exe)
+          parsed = lief.MachO.parse(path)
+          binary = None
+          for b in parsed:
+              if b.header.cpu_type == lief.MachO.Header.CPU_TYPE.ARM64:
+                  binary = b
+          if binary is None:
+              binary = parsed.at(0)
+          binary.write("work/main_arm64")
+          report = {
+              "libraries": [l.name for l in binary.libraries],
+              "symbol_count": len(list(binary.symbols)),
+              "encrypted": None,
+          }
+          try:
+              report["encrypted"] = binary.encryption_info.crypt_id != 0
+          except Exception:
+              pass
+          json.dump(report, open("out/macho_report.json", "w"), indent=2)
+          open("out/symbols.txt", "w").write("\n".join(s.name for s in binary.symbols))
+          print(json.dumps(report, indent=2)[:1500])
+          if report["encrypted"]:
+              print("::warning::Binary is FairPlay-encrypted. Decompile output will be garbage. Use a decrypted IPA.")
+          PY
+          strings -n 6 work/main_arm64 > out/strings.txt
+          # Objective-C / Swift names visible in strings
+          grep -E '^(_?OBJC_CLASS_\$_|\$s[A-Za-z0-9_]+)' out/symbols.txt > out/objc_swift_symbols.txt || true
+          # Embedded JS / Flutter / React Native payloads
+          find "$APP" \( -name '*.jsbundle' -o -name 'main.js' -o -name 'libapp.so' -o -name 'App.framework' -o -name '*.wasm' \) > out/embedded_payloads.txt || true
+
+      - name: Install Ghidra
+        if: ${{ inputs.decompile }}
+        run: |
+          curl -fL "$GHIDRA_URL" -o ghidra.zip
+          unzip -q ghidra.zip -d "$HOME"
+          echo "GHIDRA_HOME=$(ls -d $HOME/ghidra_*_PUBLIC)" >> "$GITHUB_ENV"
+
+      - name: Ghidra headless decompile to pseudo-C
+        if: ${{ inputs.decompile }}
+        run: |
+          mkdir -p scripts ghidra_proj
+          cat > scripts/DecompileAll.java <<'EOF'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.app.decompiler.*;
+          import ghidra.program.model.listing.*;
+          import java.io.*;
+
+          public class DecompileAll extends GhidraScript {
+            public void run() throws Exception {
+              String[] args = getScriptArgs();
+              File out = new File(args.length > 0 ? args[0] : "decompiled.c");
+              DecompInterface ifc = new DecompInterface();
+              ifc.openProgram(currentProgram);
+              try (PrintWriter w = new PrintWriter(out)) {
+                for (Function f : currentProgram.getFunctionManager().getFunctions(true)) {
+                  if (monitor.isCancelled()) break;
+                  DecompileResults r = ifc.decompileFunction(f, 60, monitor);
+                  if (r.decompileCompleted()) {
+                    w.println("// " + f.getEntryPoint() + " " + f.getName());
+                    w.println(r.getDecompiledFunction().getC());
+                  }
+                }
+              }
+            }
+          }
+          EOF
+          "$GHIDRA_HOME/support/analyzeHeadless" ghidra_proj proj \
+            -import work/main_arm64 \
+            -scriptPath "$PWD/scripts" \
+            -postScript DecompileAll.java "$PWD/out/decompiled.c" \
+            -deleteProject
+          ls -lh out/decompiled.c
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-analysis
+          path: out/
